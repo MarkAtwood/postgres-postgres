@@ -371,7 +371,6 @@ char *
 pgtls_get_peer_certificate_hash(PGconn *conn, size_t *len)
 {
 	X509	   *peer_cert;
-	const EVP_MD *algo_type;
 	unsigned char hash[EVP_MAX_MD_SIZE];	/* size for SHA-512 */
 	unsigned int hash_size;
 	int			algo_nid;
@@ -406,28 +405,77 @@ pgtls_get_peer_certificate_hash(PGconn *conn, size_t *len)
 	 * (https://tools.ietf.org/html/rfc5929#section-4.1).  If something else
 	 * is used, the same hash as the signature algorithm is used.
 	 */
-	switch (algo_nid)
-	{
-		case NID_md5:
-		case NID_sha1:
-			algo_type = EVP_sha256();
-			break;
-		default:
-			algo_type = EVP_get_digestbynid(algo_nid);
-			if (algo_type == NULL)
-			{
-				libpq_append_conn_error(conn, "could not find digest for NID %s",
-										OBJ_nid2sn(algo_nid));
-				return NULL;
-			}
-			break;
-	}
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
 
-	if (!X509_digest(peer_cert, algo_type, hash, &hash_size))
+	/*
+	 * On OpenSSL 3.0 and newer, explicitly fetch the digest by name so that it
+	 * is served by the loaded provider.  The fetched EVP_MD must be freed on
+	 * every path, including the error paths.
+	 */
 	{
-		libpq_append_conn_error(conn, "could not generate peer certificate hash");
-		return NULL;
+		EVP_MD	   *algo_type;
+		const char *algo_name;
+
+		switch (algo_nid)
+		{
+			case NID_md5:
+			case NID_sha1:
+				algo_name = "SHA256";
+				break;
+			default:
+				algo_name = OBJ_nid2sn(algo_nid);
+				if (algo_name == NULL)
+				{
+					libpq_append_conn_error(conn, "could not determine digest for server certificate signature algorithm");
+					return NULL;
+				}
+				break;
+		}
+
+		algo_type = EVP_MD_fetch(NULL, algo_name, NULL);
+		if (algo_type == NULL)
+		{
+			libpq_append_conn_error(conn, "could not load digest \"%s\"", algo_name);
+			return NULL;
+		}
+
+		if (!X509_digest(peer_cert, algo_type, hash, &hash_size))
+		{
+			EVP_MD_free(algo_type);
+			libpq_append_conn_error(conn, "could not generate peer certificate hash");
+			return NULL;
+		}
+
+		EVP_MD_free(algo_type);
 	}
+#else
+	{
+		const EVP_MD *algo_type;
+
+		switch (algo_nid)
+		{
+			case NID_md5:
+			case NID_sha1:
+				algo_type = EVP_sha256();
+				break;
+			default:
+				algo_type = EVP_get_digestbynid(algo_nid);
+				if (algo_type == NULL)
+				{
+					libpq_append_conn_error(conn, "could not find digest for NID %s",
+											OBJ_nid2sn(algo_nid));
+					return NULL;
+				}
+				break;
+		}
+
+		if (!X509_digest(peer_cert, algo_type, hash, &hash_size))
+		{
+			libpq_append_conn_error(conn, "could not generate peer certificate hash");
+			return NULL;
+		}
+	}
+#endif
 
 	/* save result */
 	cert_hash = malloc(hash_size);
