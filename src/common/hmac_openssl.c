@@ -22,7 +22,13 @@
 
 
 #include <openssl/err.h>
+#include <openssl/evp.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#include <openssl/core_names.h>
+#include <openssl/params.h>
+#else
 #include <openssl/hmac.h>
+#endif
 
 #include "common/hmac.h"
 #include "common/md5.h"
@@ -58,7 +64,12 @@ typedef enum pg_hmac_errno
 /* Internal pg_hmac_ctx structure */
 struct pg_hmac_ctx
 {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+	EVP_MAC    *mac;
+	EVP_MAC_CTX *hmacctx;
+#else
 	HMAC_CTX   *hmacctx;
+#endif
 	pg_cryptohash_type type;
 	pg_hmac_errno error;
 	const char *errreason;
@@ -139,6 +150,32 @@ pg_hmac_create(pg_cryptohash_type type)
 	ResourceOwnerEnlarge(CurrentResourceOwner);
 #endif
 
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+
+	/*
+	 * On OpenSSL 3.0 and newer, use the EVP_MAC API so that the HMAC
+	 * implementation is served by the loaded provider, rather than the
+	 * deprecated HMAC_CTX interface which bypasses provider dispatch.  This
+	 * lets a third-party or FIPS provider service PostgreSQL's HMAC.  The
+	 * digest is selected later, in pg_hmac_init().
+	 */
+	ctx->mac = EVP_MAC_fetch(NULL, "HMAC", NULL);
+	if (ctx->mac != NULL)
+		ctx->hmacctx = EVP_MAC_CTX_new(ctx->mac);
+
+	if (ctx->hmacctx == NULL)
+	{
+		EVP_MAC_free(ctx->mac);
+		explicit_bzero(ctx, sizeof(pg_hmac_ctx));
+		FREE(ctx);
+#ifndef FRONTEND
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("out of memory")));
+#endif
+		return NULL;
+	}
+#else
 	ctx->hmacctx = HMAC_CTX_new();
 
 	if (ctx->hmacctx == NULL)
@@ -152,6 +189,7 @@ pg_hmac_create(pg_cryptohash_type type)
 #endif
 		return NULL;
 	}
+#endif
 
 
 #ifdef USE_RESOWNER_FOR_HMAC
@@ -175,6 +213,40 @@ pg_hmac_init(pg_hmac_ctx *ctx, const uint8 *key, size_t len)
 	if (ctx == NULL)
 		return -1;
 
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+	{
+		const char *digest = NULL;
+		OSSL_PARAM	params[2];
+
+		switch (ctx->type)
+		{
+			case PG_MD5:
+				digest = "MD5";
+				break;
+			case PG_SHA1:
+				digest = "SHA1";
+				break;
+			case PG_SHA224:
+				digest = "SHA224";
+				break;
+			case PG_SHA256:
+				digest = "SHA256";
+				break;
+			case PG_SHA384:
+				digest = "SHA384";
+				break;
+			case PG_SHA512:
+				digest = "SHA512";
+				break;
+		}
+
+		params[0] = OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_DIGEST,
+													 unconstify(char *, digest), 0);
+		params[1] = OSSL_PARAM_construct_end();
+
+		status = EVP_MAC_init(ctx->hmacctx, key, len, params);
+	}
+#else
 	switch (ctx->type)
 	{
 		case PG_MD5:
@@ -196,6 +268,7 @@ pg_hmac_init(pg_hmac_ctx *ctx, const uint8 *key, size_t len)
 			status = HMAC_Init_ex(ctx->hmacctx, key, len, EVP_sha512(), NULL);
 			break;
 	}
+#endif
 
 	/* OpenSSL internals return 1 on success, 0 on failure */
 	if (status <= 0)
@@ -221,7 +294,11 @@ pg_hmac_update(pg_hmac_ctx *ctx, const uint8 *data, size_t len)
 	if (ctx == NULL)
 		return -1;
 
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+	status = EVP_MAC_update(ctx->hmacctx, data, len);
+#else
 	status = HMAC_Update(ctx->hmacctx, data, len);
+#endif
 
 	/* OpenSSL internals return 1 on success, 0 on failure */
 	if (status <= 0)
@@ -242,7 +319,9 @@ int
 pg_hmac_final(pg_hmac_ctx *ctx, uint8 *dest, size_t len)
 {
 	int			status = 0;
+#if OPENSSL_VERSION_NUMBER < 0x30000000L
 	uint32		outlen;
+#endif
 
 	if (ctx == NULL)
 		return -1;
@@ -293,7 +372,15 @@ pg_hmac_final(pg_hmac_ctx *ctx, uint8 *dest, size_t len)
 			break;
 	}
 
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+	{
+		size_t		outlen;
+
+		status = EVP_MAC_final(ctx->hmacctx, dest, &outlen, len);
+	}
+#else
 	status = HMAC_Final(ctx->hmacctx, dest, &outlen);
+#endif
 
 	/* OpenSSL internals return 1 on success, 0 on failure */
 	if (status <= 0)
@@ -316,7 +403,12 @@ pg_hmac_free(pg_hmac_ctx *ctx)
 	if (ctx == NULL)
 		return;
 
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+	EVP_MAC_CTX_free(ctx->hmacctx);
+	EVP_MAC_free(ctx->mac);
+#else
 	HMAC_CTX_free(ctx->hmacctx);
+#endif
 #ifdef USE_RESOWNER_FOR_HMAC
 	if (ctx->resowner)
 		ResourceOwnerForgetHMAC(ctx->resowner, ctx);
