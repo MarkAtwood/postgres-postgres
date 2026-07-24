@@ -67,6 +67,9 @@ struct pg_cryptohash_ctx
 	const char *errreason;
 
 	EVP_MD_CTX *evpctx;
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+	EVP_MD	   *algo;
+#endif
 
 #ifndef FRONTEND
 	ResourceOwner resowner;
@@ -182,6 +185,56 @@ pg_cryptohash_init(pg_cryptohash_ctx *ctx)
 	if (ctx == NULL)
 		return -1;
 
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+
+	/*
+	 * On OpenSSL 3.0 and newer, explicitly fetch the digest implementation so
+	 * that it is served by the loaded provider.  This lets a third-party or
+	 * FIPS provider service PostgreSQL's hashing, rather than relying on the
+	 * implicit lookup done by EVP_md5()/EVP_sha*().  The fetched EVP_MD is
+	 * cached in the context and released in pg_cryptohash_free().
+	 */
+	{
+		const char *name = NULL;
+
+		switch (ctx->type)
+		{
+			case PG_MD5:
+				name = "MD5";
+				break;
+			case PG_SHA1:
+				name = "SHA1";
+				break;
+			case PG_SHA224:
+				name = "SHA224";
+				break;
+			case PG_SHA256:
+				name = "SHA256";
+				break;
+			case PG_SHA384:
+				name = "SHA384";
+				break;
+			case PG_SHA512:
+				name = "SHA512";
+				break;
+		}
+
+		/*
+		 * ctx->type is fixed for the lifetime of the context, so the digest
+		 * only needs to be fetched once; a second pg_cryptohash_init() on the
+		 * same context reuses it.  Freeing and re-fetching here would drop the
+		 * EVP_MD while the previous EVP_MD_CTX still references it, and would
+		 * also repeat the relatively expensive provider lookup needlessly.
+		 */
+		if (ctx->algo == NULL && name != NULL)
+			ctx->algo = EVP_MD_fetch(NULL, name, NULL);
+
+		if (ctx->algo != NULL)
+			status = EVP_DigestInit_ex(ctx->evpctx, ctx->algo, NULL);
+		else
+			status = 0;
+	}
+#else
 	switch (ctx->type)
 	{
 		case PG_MD5:
@@ -203,6 +256,7 @@ pg_cryptohash_init(pg_cryptohash_ctx *ctx)
 			status = EVP_DigestInit_ex(ctx->evpctx, EVP_sha512(), NULL);
 			break;
 	}
+#endif
 
 	/* OpenSSL internals return 1 on success, 0 on failure */
 	if (status <= 0)
@@ -329,6 +383,9 @@ pg_cryptohash_free(pg_cryptohash_ctx *ctx)
 		return;
 
 	EVP_MD_CTX_destroy(ctx->evpctx);
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+	EVP_MD_free(ctx->algo);
+#endif
 
 #ifndef FRONTEND
 	if (ctx->resowner)
